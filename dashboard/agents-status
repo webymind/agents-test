@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Génère l'état de l'équipe d'agents en JSON (lu par le tableau de bord index.html).
+Lancé chaque minute par root : runuser -u agents -- /home/agents/bin/agents-status > status.json
+Aucun nom de projet : uniquement des références (RCL, TST…). Aucun secret."""
+import json, re, subprocess, datetime, os
+
+REPOS = {"webymind/la-rougaille-creole": "RCL", "webymind/agents-test": "TST"}
+LOG = os.path.expanduser("~/agent-worker.log")
+
+def gh(args):
+    try:
+        r = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout or "[]")
+    except Exception:
+        return []
+
+projects, alerts = [], []
+for repo, ref in REPOS.items():
+    tasks = []
+    for i in sorted(gh(["issue", "list", "-R", repo, "--state", "all", "--limit", "200",
+                        "--json", "number,title,state,labels"]), key=lambda x: x["number"]):
+        L = {l["name"] for l in i["labels"]}
+        if "agent-fait" in L or i["state"] == "CLOSED": st = "done"
+        elif "besoin-mathieu" in L:
+            st = "blocked"; alerts.append({"ref": ref, "n": i["number"], "text": "Tâche bloquée : Claude doit intervenir"})
+        elif "agent-en-cours" in L: st = "doing"
+        elif "agent" in L: st = "todo"
+        else: continue
+        title = re.sub(r"^\d+\.\s*", "", i["title"])[:80]
+        tasks.append({"n": i["number"], "title": title, "state": st, "complexe": "complexe" in L})
+    projects.append({"ref": ref, "tasks": tasks})
+
+# Journal du chef d'équipe
+try:
+    lines = open(LOG, encoding="utf-8", errors="replace").read().splitlines()[-600:]
+except OSError:
+    lines = []
+agents = {k: {"id": k, "runs": 0, "reviews": 0, "model": None, "active": False}
+          for k in ("gratuit", "gemini", "codex", "claude")}
+events, cur_time, cur_ref, cur = [], "", "", None
+rev_ref = {v: k for k, v in REPOS.items()}
+for ln in lines:
+    m = re.match(r"=== (\S+ (\d\d:\d\d)):\d\d ===", ln)
+    if m: cur_time = m.group(2); cur = None; continue
+    m = re.match(r"\[(\S+)\] issue #(\d+)", ln)
+    if m:
+        cur_ref = REPOS.get(m.group(1), "?")
+        events.append({"t": cur_time, "text": f"{cur_ref} · tâche {m.group(2)} prise en charge"}); continue
+    m = re.match(r"codeur: (.+)", ln)
+    if m:
+        w = m.group(1)
+        k = "gemini" if w.startswith("gemini") else "codex" if w.startswith("codex") else "claude" if w.startswith("claude") else "gratuit"
+        agents[k]["runs"] += 1
+        if k == "gratuit": agents[k]["model"] = w.split("/")[-1]
+        cur = {"agent": k, "phase": "code", "ref": cur_ref}
+        events.append({"t": cur_time, "text": f"{cur_ref} · {k} code"}); continue
+    m = re.match(r"relecteur (\w+), tour (\d)", ln)
+    if m:
+        k = m.group(1); agents.setdefault(k, {"id": k, "runs": 0, "reviews": 0, "model": None, "active": False})
+        agents[k]["reviews"] += 1
+        cur = {"agent": k, "phase": "relecture", "ref": cur_ref, "round": int(m.group(2))}
+        events.append({"t": cur_time, "text": f"{cur_ref} · {k} relit (tour {m.group(2)})"}); continue
+    if "VERDICT: APPROUVE" in ln: events.append({"t": cur_time, "text": f"{cur_ref} · approuvé ✓"})
+    elif "VERDICT: CHANGEMENTS" in ln: events.append({"t": cur_time, "text": f"{cur_ref} · corrections demandées"})
+    elif ln.startswith("FUSIONNÉ"): events.append({"t": cur_time, "text": f"{cur_ref} · fusionné dans le projet"}); cur = None
+    elif "en pause" in ln: events.append({"t": cur_time, "text": f"{cur_ref or ''} projet en pause : attend Claude".strip()})
+
+try:
+    running = subprocess.run(["systemctl", "is-active", "agent-worker.service"],
+                             capture_output=True, text=True).stdout.strip() in ("active", "activating")
+except Exception:
+    running = False
+# Estimation grossière (les abonnements ne publient pas leur consommation) :
+# ~60 000 jetons par passage de code, ~25 000 par relecture.
+for a in agents.values():
+    a["est_tokens"] = a["runs"] * 60000 + a["reviews"] * 25000
+if running and cur:
+    agents[cur["agent"]]["active"] = True
+else:
+    cur = None
+
+print(json.dumps({
+    "updated": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    "running": running, "current": cur, "projects": projects,
+    "agents": list(agents.values()), "events": events[-25:][::-1], "alerts": alerts,
+}, ensure_ascii=False))
