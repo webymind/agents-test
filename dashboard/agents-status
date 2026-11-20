@@ -31,8 +31,13 @@ for repo, ref in REPOS.items():
     projects.append({"ref": ref, "tasks": tasks})
 
 # Journal du chef d'équipe
+# Les agents écrivent des milliers de lignes dans le journal : on lit les 3 derniers Mo
+# et on ne garde que les lignes repères du chef d'équipe.
+MARK = re.compile(r"^(=== |\[\S+\] issue #|codeur: |relecteur |VERDICT: |FUSIONNÉ|.*en pause)")
 try:
-    lines = open(LOG, encoding="utf-8", errors="replace").read().splitlines()[-600:]
+    with open(LOG, "rb") as f:
+        f.seek(0, 2); f.seek(max(0, f.tell() - 3_000_000))
+        lines = [l for l in f.read().decode("utf-8", "replace").splitlines() if MARK.match(l)]
 except OSError:
     lines = []
 agents = {k: {"id": k, "runs": 0, "reviews": 0, "model": None, "active": False}
@@ -76,6 +81,9 @@ for a in agents.values():
     a["est_tokens"] = a["runs"] * 60000 + a["reviews"] * 25000
 if running and cur:
     agents[cur["agent"]]["active"] = True
+elif running:
+    doing = next((p["ref"] for p in projects for t in p["tasks"] if t["state"] == "doing"), None)
+    cur = {"agent": "sup", "phase": "préparation", "ref": doing} if doing else None
 else:
     cur = None
 

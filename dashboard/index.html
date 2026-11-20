@@ -130,7 +130,7 @@ function render(){
   const all=D.projects.flatMap(p=>p.tasks),cnt=s=>all.filter(t=>t.state==s).length;
   $('k1').textContent=cnt('doing');$('k2').textContent=cnt('done');$('k3').textContent=cnt('todo');$('k4').textContent=cnt('blocked');$('k5').textContent='≈ '+fmt(D.agents.reduce((s,a)=>s+(a.est_tokens??(a.runs*60000+a.reviews*25000)),0));
   const na=D.alerts.length;$('nb').textContent=na;$('bell').classList.toggle('has',na>0);
-  const c=D.current;$('now').innerHTML=c?`<b>${AG[c.agent]?.name||c.agent}</b> · ${c.phase}${c.round?' tour '+c.round:''} · ${c.ref}`:(D.running?'Le chef d\'équipe prépare la suite':'Équipe en veille · prochain passage sous 10 min');
+  const c=D.current;$('now').innerHTML=c?`<b>${AG[c.agent]?.name||'Chef d\'équipe'}</b> · ${c.phase}${c.round?' tour '+c.round:''} · ${c.ref}`:(D.running?'Le chef d\'équipe prépare la suite':'Équipe en veille · prochain passage sous 10 min');
   const mx=Math.max(1,...D.agents.map(a=>a.runs+a.reviews));
   $('agents').innerHTML=D.agents.map(a=>{const g=AG[a.id]||{name:a.id,ab:'?',c:'#888'};return `<div class="ag ${a.active?'on':''}" style="--c:${g.c}"><span class="dot">${g.ab}</span><div><div class="nm">${g.name}</div><div class="md">${a.model?a.model+' · ':''}${a.runs} code · ${a.reviews} relecture · ≈ ${fmt(a.est_tokens??(a.runs*60000+a.reviews*25000))} jetons</div><div class="bar"><i style="width:${(a.runs+a.reviews)/mx*100}%"></i></div></div><span class="st">${a.active?'actif':'au repos'}</span></div>`}).join('');
   $('feed').innerHTML=D.events.length?D.events.map(e=>`<li><time>${e.t}</time><span>${esc(e.text)}</span></li>`).join(''):'<li><time>—</time><span>Aucune activité pour l\'instant</span></li>';
