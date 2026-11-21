@@ -1,0 +1,157 @@
+#!/bin/bash
+# Chef d'équipe Webymind (v3, 21/11/2026 soir) — lancé toutes les 10 min par agent-worker.timer, dans la cage.
+#
+# Pourquoi la v3 : le 21/11 vers 14h15 le pipeline s'est arrêté net sans aucune alerte.
+#   1) Codex a atteint sa limite d'usage, mais la chaîne ne le savait pas et continuait à l'appeler.
+#   2) Un passage tué en cours de route (limite mémoire de la cage, coupure) laissait l'issue
+#      « agent-en-cours » pour toujours : le worker passait à la suivante sans rien signaler.
+#   3) Aucune notification n'arrivait sur le téléphone de Mathieu.
+#
+# Règles v3 :
+#   - Un agent qui répond « limite / quota / 429 » est mis de côté 3 h (fichier ~/.agents-indispo/<agent>),
+#     la tâche continue IMMÉDIATEMENT avec l'agent suivant. Mathieu est prévenu.
+#   - Codeurs : issue « complexe » = codex -> gemini -> gratuit ; sinon gratuit -> gemini -> codex.
+#   - Relecteur : premier agent DISPONIBLE parmi codex, gemini, gratuit, différent du codeur
+#     (personne ne valide son propre travail).
+#   - Au démarrage, toute issue « agent-en-cours » est orpheline (le verrou garantit qu'aucun autre
+#     passage ne tourne) : elle est remise en file. Au 3e échec -> « besoin-mathieu » + notification.
+#   - Une issue bloquée N'ARRÊTE PLUS le projet : le worker passe aux autres tâches.
+#   - Les issues étiquetées « claude-superviseur » sont reprises par Claude : le worker n'y touche pas.
+#   - Notification téléphone gratuite via ntfy (variable NTFY_TOPIC dans ~/.bashrc), références seulement (RCL…).
+#   - Claude n'est JAMAIS lancé automatiquement (décision de Mathieu du 21/11).
+set -u
+REPOS="webymind/la-rougaille-creole webymind/agents-test"
+declare -A REF=([webymind/la-rougaille-creole]=RCL [webymind/agents-test]=TST)
+LOG="$HOME/agent-worker.log"
+TO=5400          # 90 min max par passage de codeur
+PAUSE_QUOTA=10800  # 3 h de mise de côté après une limite d'usage
+INDISPO="$HOME/.agents-indispo"; ESSAIS="$HOME/.agents-essais"
+mkdir -p "$INDISPO" "$ESSAIS"
+exec >>"$LOG" 2>&1
+exec 9>"$HOME/.agent-worker.lock"; flock -n 9 || exit 0
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+. "$HOME/.nvm/nvm.sh" >/dev/null
+eval "$(grep -E '^export (OPENROUTER_API_KEY|NVIDIA_API_KEY|NTFY_TOPIC)=' "$HOME/.bashrc")"
+echo "=== $(date '+%F %T') ==="
+
+notif() { # $1 = titre, $2 = message, $3 = priorité ntfy (3 normal, 4 haute, 5 urgente)
+  echo "NOTIF: $1 — $2"
+  [ -n "${NTFY_TOPIC:-}" ] || return 0
+  curl -s -m 20 -H "Title: $1" -H "Priority: ${3:-4}" -H "Tags: robot" \
+       -d "$2" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null || true
+}
+
+dispo() { # l'agent $1 est-il utilisable maintenant ?
+  local f="$INDISPO/$1"
+  [ -f "$f" ] || return 0
+  [ "$(date +%s)" -ge "$(cat "$f")" ] && { rm -f "$f"; notif "Agent de retour" "$1 est de nouveau disponible." 3; return 0; }
+  return 1
+}
+mettre_de_cote() { # $1 = agent
+  [ -f "$INDISPO/$1" ] && return
+  echo $(( $(date +%s) + PAUSE_QUOTA )) > "$INDISPO/$1"
+  notif "Limite atteinte : $1" "$1 a atteint sa limite d'usage. Il est mis de côté 3 h, le travail continue avec les autres agents." 4
+}
+limite_atteinte() { # le texte $1 signale-t-il une limite / un quota ?
+  echo "$1" | tail -60 | grep -qiE "usage limit|rate.?limit|quota|RESOURCE_EXHAUSTED|too many requests|\b429\b|exceeded your|limit reached|insufficient credits"
+}
+
+lancer() { # $1 = agent, $2 = consigne, $3 = délai max ; affiche la sortie, code retour 0 si OK, 2 si limite
+  local OUT RC; LAST_OUT=""
+  case "$1" in
+    gratuit) local M; M=$(modele-gratuit) || { echo "aucun modèle gratuit dispo"; mettre_de_cote gratuit; return 2; }
+             echo "modèle gratuit: $M"; OUT=$(timeout "$3" opencode run -m "$M" "$2" 2>&1); RC=$? ;;
+    gemini)  OUT=$(timeout "$3" agy -p "$2" --dangerously-skip-permissions 2>&1); RC=$? ;;
+    codex)   OUT=$(timeout "$3" codex exec "$2" 2>&1); RC=$? ;;
+  esac
+  echo "$OUT" | tail -200
+  if limite_atteinte "$OUT"; then mettre_de_cote "$1"; return 2; fi
+  LAST_OUT="$OUT"
+  return $RC
+}
+code_avec() { echo "codeur: $1"; lancer "$1" "$2" "$TO"; }
+relecteur_pour() { # premier relecteur disponible, différent du codeur $1
+  local r; for r in codex gemini gratuit; do [ "$r" != "$1" ] && dispo "$r" && { echo "$r"; return 0; }; done; return 1
+}
+
+for REPO in $REPOS; do
+  R=${REF[$REPO]:-?}
+
+  # 1) Issues orphelines (passage tué en cours de route) : remise en file, ou alerte au 3e échec.
+  for O in $(gh issue list -R "$REPO" --label agent-en-cours --state open --json number,labels \
+             -q '.[] | select([.labels[].name] | index("claude-superviseur") | not) | .number' 2>/dev/null); do
+    F="$ESSAIS/${R}-$O"; E=$(( $(cat "$F" 2>/dev/null || echo 0) + 1 )); echo "$E" > "$F"
+    if [ "$E" -ge 3 ]; then
+      gh issue edit "$O" -R "$REPO" --remove-label agent-en-cours --add-label besoin-mathieu
+      gh issue comment "$O" -R "$REPO" --body "⚠️ 3 passages interrompus sur cette tâche. Claude (superviseur) doit intervenir."
+      notif "$R · tâche $O bloquée" "3 passages interrompus. Claude doit intervenir (les autres tâches continuent)." 5
+    else
+      echo "[$REPO] issue #$O orpheline -> remise en file (essai $E)"
+      gh issue edit "$O" -R "$REPO" --remove-label agent-en-cours --add-label agent
+    fi
+  done
+
+  # 2) Prochaine tâche : la plus ancienne « agent », hors bloquées et hors reprises par Claude.
+  N=$(gh issue list -R "$REPO" --label agent --state open --search "sort:created-asc" --json number,labels \
+      -q '[.[] | select([.labels[].name] | (index("besoin-mathieu") or index("claude-superviseur")) | not)][0].number // empty' 2>/dev/null)
+  [ -z "$N" ] && continue
+  echo "[$REPO] issue #$N"
+  gh issue edit "$N" -R "$REPO" --remove-label agent --add-label agent-en-cours
+  DIR="$HOME/projets/${REPO#*/}"
+  [ -d "$DIR" ] || gh repo clone "$REPO" "$DIR"
+  cd "$DIR" && git fetch -q origin && git checkout -q -f main && git reset -q --hard origin/main
+  BR="agent/issue-$N"
+  if git ls-remote --exit-code --heads origin "$BR" >/dev/null; then
+    git checkout -q -B "$BR" "origin/$BR"   # on reprend le travail déjà poussé au lieu de repartir de zéro
+  else git checkout -q -B "$BR"; fi
+
+  VERIF="Avant de pousser, si le dépôt contient un package.json : npm install, puis npm run lint, npm run typecheck et npm run build doivent TOUS passer ; corrige jusqu'à ce que tout soit vert. Si la branche est en conflit avec main, fais git merge origin/main et résous les conflits sans rien perdre."
+  POUSSE="Ensuite : git add -A, git commit avec un message clair en français, git push -u --force-with-lease origin $BR. S'il n'existe pas encore de PR ouverte pour la branche $BR, crée-la : gh pr create -R $REPO --base main --head $BR, avec un titre clair et une description (ce qui a été fait, sortie des commandes de vérification, et la ligne 'Closes #$N'). Si la PR existe déjà, contente-toi de pousser."
+  TACHE="Tu es développeur senior dans une agence web premium (Webymind). Dépôt : $REPO (tu es dans son dossier, sur la branche $BR). Ta mission : l'issue #$N. Lis-la : gh issue view $N -R $REPO. AVANT de coder, lis CLAUDE.md à la racine (règles OBLIGATOIRES) et les fichiers qu'il cite (maquette, brief). Réalise l'issue ENTIÈREMENT, sans rien simplifier, sans casser ce qui existe. Les photos et infos client manquantes : valeurs par défaut modifiables par le gérant. $VERIF $POUSSE Travaille sans poser de questions ; réponds en français."
+  CORRIGE="Tu es développeur senior (Webymind). Dépôt : $REPO, branche $BR, liée à l'issue #$N. Lis CLAUDE.md, l'issue (gh issue view $N -R $REPO) et TOUS les commentaires de relecture de la PR (gh pr view --comments -R $REPO $BR). Corrige TOUT ce que le relecteur demande, et termine ce qui manque. $VERIF Puis git add -A, git commit, git push --force-with-lease origin $BR. Travaille sans poser de questions."
+
+  if gh issue view "$N" -R "$REPO" --json labels -q '.labels[].name' | grep -qx complexe; then
+    CHAINE="codex gemini gratuit"; else CHAINE="gratuit gemini codex"; fi
+
+  OK=0; PR=""; ESSAYES=""
+  for C in $CHAINE; do
+    dispo "$C" || { echo "$C indisponible (limite) -> suivant"; continue; }
+    ESSAYES="$ESSAYES $C"
+    PR=$(gh pr list -R "$REPO" --head "$BR" --state open --json number -q '.[0].number')
+    if [ -z "$PR" ]; then code_avec "$C" "$TACHE"; else code_avec "$C" "$CORRIGE"; fi
+    [ $? -eq 2 ] && { echo "$C a atteint sa limite -> suivant"; continue; }
+    PR=$(gh pr list -R "$REPO" --head "$BR" --state open --json number -q '.[0].number')
+    [ -z "$PR" ] && { echo "$C : pas de PR -> suivant"; continue; }
+    for TOUR in 1 2 3; do
+      REL=$(relecteur_pour "$C") || { echo "aucun relecteur disponible"; break; }
+      echo "relecteur $REL, tour $TOUR :"
+      lancer "$REL" "Tu es le relecteur EXIGEANT de l'agence Webymind. Dépôt $REPO. Lis CLAUDE.md (règles obligatoires). Examine la PR #$PR (gh pr view $PR -R $REPO ; gh pr diff $PR -R $REPO) par rapport à l'issue #$N (gh issue view $N -R $REPO). Vérifie : 1) l'issue est ENTIÈREMENT réalisée ; 2) les règles de CLAUDE.md sont respectées (UX/UI premium, mobile façon app iPhone, PWA, aucun rechargement de page, PostgreSQL, aucun secret, aucun service payant) ; 3) sécurité (injections, secrets, fuites de données, RGPD) ; 4) si un package.json existe, git fetch origin $BR && git checkout -f $BR puis npm install && npm run build doivent passer ; 5) rien de cassé. Poste ton avis détaillé et précis en français avec gh pr comment $PR -R $REPO. La DERNIÈRE ligne de ta réponse doit être exactement VERDICT: APPROUVE ou VERDICT: CHANGEMENTS." 1800 >/dev/null
+      RC=$?
+      [ $RC -eq 2 ] && { echo "relecteur $REL à sa limite -> autre relecteur"; continue; }
+      V="${LAST_OUT:-}"; echo "$V" | tail -3
+      if echo "$V" | tail -5 | grep -q "VERDICT: APPROUVE"; then OK=1; break; fi
+      [ "$TOUR" -lt 3 ] && { code_avec "$C" "$CORRIGE"; [ $? -eq 2 ] && break; }
+    done
+    [ "$OK" = 1 ] && break
+    echo "$C : pas approuvé -> suivant"
+  done
+
+  cd "$DIR" && git checkout -q -f main
+  if [ "$OK" = 1 ]; then
+    gh pr merge "$PR" -R "$REPO" --squash --delete-branch
+    gh issue edit "$N" -R "$REPO" --remove-label agent-en-cours --add-label agent-fait
+    rm -f "$ESSAIS/${R}-$N"
+    echo "FUSIONNÉ PR #$PR"
+    RESTE=$(gh issue list -R "$REPO" --state open --label agent --json number -q 'length')
+    [ "$RESTE" = 0 ] && notif "$R · plus aucune tâche en file" "Toutes les tâches confiées aux agents sont fusionnées ou reprises par Claude." 3
+  elif [ -z "$ESSAYES" ]; then
+    # Tous les agents sont à leur limite : on remet la tâche en file, reprise automatique au retour d'un agent.
+    gh issue edit "$N" -R "$REPO" --remove-label agent-en-cours --add-label agent
+    notif "$R · tous les agents à leur limite" "Tâche $N remise en file. Reprise automatique dès qu'un agent revient. Claude peut prendre le relais si c'est urgent." 5
+  else
+    gh issue edit "$N" -R "$REPO" --remove-label agent-en-cours --add-label besoin-mathieu
+    gh issue comment "$N" -R "$REPO" --body "⚠️ Aucun agent ($ESSAYES ) n'a obtenu l'approbation. Claude (superviseur) va examiner. Les autres tâches continuent."
+    notif "$R · tâche $N bloquée" "Aucun agent n'a obtenu l'approbation. Claude doit intervenir. Les autres tâches continuent." 5
+  fi
+  break
+done

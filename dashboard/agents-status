@@ -23,6 +23,7 @@ for repo, ref in REPOS.items():
         if "agent-fait" in L or i["state"] == "CLOSED": st = "done"
         elif "besoin-mathieu" in L:
             st = "blocked"; alerts.append({"ref": ref, "n": i["number"], "text": "Tâche bloquée : Claude doit intervenir"})
+        elif "claude-superviseur" in L: st = "doing"
         elif "agent-en-cours" in L: st = "doing"
         elif "agent" in L: st = "todo"
         else: continue
@@ -33,7 +34,7 @@ for repo, ref in REPOS.items():
 # Journal du chef d'équipe
 # Les agents écrivent des milliers de lignes dans le journal : on lit les 3 derniers Mo
 # et on ne garde que les lignes repères du chef d'équipe.
-MARK = re.compile(r"^(=== |\[\S+\] issue #|codeur: |relecteur |VERDICT: |FUSIONNÉ|.*en pause)")
+MARK = re.compile(r"^(=== |\[\S+\] issue #|codeur: |relecteur |VERDICT: |FUSIONNÉ|NOTIF: |.*en pause)")
 try:
     with open(LOG, "rb") as f:
         f.seek(0, 2); f.seek(max(0, f.tell() - 3_000_000))
@@ -68,7 +69,20 @@ for ln in lines:
     if "VERDICT: APPROUVE" in ln: events.append({"t": cur_time, "text": f"{cur_ref} · approuvé ✓"})
     elif "VERDICT: CHANGEMENTS" in ln: events.append({"t": cur_time, "text": f"{cur_ref} · corrections demandées"})
     elif ln.startswith("FUSIONNÉ"): events.append({"t": cur_time, "text": f"{cur_ref} · fusionné dans le projet"}); cur = None
+    elif ln.startswith("NOTIF: "): events.append({"t": cur_time, "text": "🔔 " + ln[7:][:120]})
     elif "en pause" in ln: events.append({"t": cur_time, "text": f"{cur_ref or ''} projet en pause : attend Claude".strip()})
+
+# Agents mis de côté après une limite d'usage (fichiers écrits par le worker v3)
+import time
+ind = os.path.expanduser("~/.agents-indispo")
+for k in (os.listdir(ind) if os.path.isdir(ind) else []):
+    try:
+        until = int(open(os.path.join(ind, k)).read().strip())
+    except Exception:
+        continue
+    if until > time.time():
+        h = datetime.datetime.fromtimestamp(until).strftime("%H:%M")
+        alerts.append({"ref": "", "n": 0, "text": f"{k} à sa limite d'usage, de retour vers {h} — le travail continue avec les autres"})
 
 try:
     running = subprocess.run(["systemctl", "is-active", "agent-worker.service"],
